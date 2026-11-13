@@ -16,17 +16,27 @@ import os
 import sys
 
 import numpy as np
-import torch
 
 
 def generate_reference(output_dir: str):
     """Generate HF reference embeddings for validation."""
+    import torch
+
     os.makedirs(output_dir, exist_ok=True)
 
     print("[EmbeddingGemma-Validate] Loading HF model...")
-    from import_model import EmbeddingGemmaWrapper
+    from sentence_transformers import SentenceTransformer
 
-    model = EmbeddingGemmaWrapper("google/embeddinggemma-300m")
+    with open(
+        os.path.join(os.path.dirname(__file__), "specs", "f32.json")
+    ) as f:
+        spec = json.load(f)
+    model_path = (
+        os.environ.get("EMBEDDINGGEMMA_MODEL_PATH")
+        or os.environ.get("BUDDY_LOCAL_MODEL_PATH")
+        or spec["hf_model_path"]
+    )
+    model = SentenceTransformer(model_path, device="cpu").float()
     model.eval()
 
     test_sentences = [
@@ -40,17 +50,16 @@ def generate_reference(output_dir: str):
     for i, text in enumerate(test_sentences):
         print(f"\n[EmbeddingGemma-Validate] Processing: {text!r}")
 
-        from sentence_transformers import SentenceTransformer
-
-        st_model = SentenceTransformer(
-            "google/embeddinggemma-300m", device="cpu"
+        tokens = model.tokenizer(
+            [text],
+            padding="max_length",
+            truncation=True,
+            max_length=int(spec["max_seq_len"]),
+            return_tensors="pt",
         )
-        tokens = st_model.tokenize([text])
-        input_ids = tokens["input_ids"]
-        attention_mask = tokens["attention_mask"]
 
         with torch.no_grad():
-            embedding = model(input_ids, attention_mask)
+            embedding = model(tokens)["sentence_embedding"]
 
         emb_np = embedding.detach().cpu().numpy().astype(np.float32)
         norm = float(np.linalg.norm(emb_np[0]))
@@ -103,6 +112,7 @@ def compare_outputs(
         references = json.load(f)
 
     all_passed = True
+    compared_count = 0
     for key, ref in references.items():
         if not key.startswith("text_"):
             continue
@@ -110,14 +120,33 @@ def compare_outputs(
         buddy_path = os.path.join(
             buddy_output_dir, f"buddy_embedding_{idx}.npy"
         )
-        if not os.path.exists(buddy_path):
-            print(f"[EmbeddingGemma-Validate] SKIP: {buddy_path} not found")
+        ref_path = os.path.join(reference_dir, f"ref_embedding_{idx}.npy")
+        missing = [p for p in (buddy_path, ref_path) if not os.path.isfile(p)]
+        if missing:
+            print(
+                f"[EmbeddingGemma-Validate] ERROR: missing embeddings: {missing}"
+            )
+            all_passed = False
             continue
 
-        buddy_emb = np.load(buddy_path)[0]
-        ref_emb = np.load(
-            os.path.join(reference_dir, f"ref_embedding_{idx}.npy")
-        )[0]
+        buddy_array = np.load(buddy_path, allow_pickle=False)
+        ref_array = np.load(ref_path, allow_pickle=False)
+        expected_shape = (1, int(ref["embedding_dim"]))
+        if (
+            buddy_array.shape != expected_shape
+            or ref_array.shape != expected_shape
+            or buddy_array.size == 0
+            or not np.isfinite(buddy_array).all()
+            or not np.isfinite(ref_array).all()
+        ):
+            print(
+                f"[EmbeddingGemma-Validate] ERROR: invalid embeddings for {key}"
+            )
+            all_passed = False
+            continue
+        buddy_emb = buddy_array[0]
+        ref_emb = ref_array[0]
+        compared_count += 1
 
         cos_sim = float(
             np.dot(ref_emb, buddy_emb)
@@ -133,6 +162,10 @@ def compare_outputs(
 
         if not passed:
             all_passed = False
+
+    if compared_count == 0:
+        print("[EmbeddingGemma-Validate] ERROR: no embeddings compared")
+        all_passed = False
 
     print(
         f"\n[EmbeddingGemma-Validate] {'ALL PASSED' if all_passed else 'SOME FAILED'}"

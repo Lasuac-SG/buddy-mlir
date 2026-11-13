@@ -144,9 +144,7 @@ void EmbeddinggemmaRunner::run(const RunConfig &cfg) {
       EmbeddinggemmaTokenizer::loadFromFile(tokenizerPath);
   std::vector<int64_t> inputIdVec, attentionMaskVec;
   tokenizer.encode(prompt, maxSeqLen, inputIdVec, attentionMaskVec);
-  printLog("Tokenization complete", suppress);
 
-  printLog("Loading model shared library", suppress);
   void *handle = dlopen(soPath.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!handle)
     throw std::runtime_error("EmbeddinggemmaRunner: dlopen failed: " + soPath +
@@ -167,10 +165,8 @@ void EmbeddinggemmaRunner::run(const RunConfig &cfg) {
     throw std::runtime_error(
         "EmbeddinggemmaRunner: weight file is not f32-aligned");
   }
-  printLog("Loading weights", suppress);
   MemRef<float, 1> paramsContainer({weightBytes / sizeof(float)});
   loadWeights(weightsPath, paramsContainer);
-  printLog("Weights loaded", suppress);
 
   MemRef<int64_t, 2> inputIds({1, maxSeqLen});
   MemRef<int64_t, 2> attentionMask({1, maxSeqLen});
@@ -181,10 +177,8 @@ void EmbeddinggemmaRunner::run(const RunConfig &cfg) {
   MemRef<float, 2> embedding({1, hiddenSize}, false, 0);
 
   const auto t0 = std::chrono::high_resolution_clock::now();
-  printLog("Calling _mlir_ciface_forward", suppress);
   forward(&embedding, &paramsContainer, &inputIds, &attentionMask);
   const auto t1 = std::chrono::high_resolution_clock::now();
-  printLog("Forward complete", suppress);
 
   const float *data = embedding.getData();
   double norm2 = 0.0;

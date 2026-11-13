@@ -69,6 +69,43 @@ The build emits these artifacts under `build/models/embeddinggemma/`:
 
 The output is the L2-normalized 768-dimensional embedding vector.
 
+## Baseline measurements
+
+On Linux, `benchmark.py` uses the existing runner and GNU `time` to collect
+end-to-end latency, the runner's first-forward latency, and peak process RSS.
+It requires NumPy; only generating HF references requires PyTorch and
+SentenceTransformers.
+
+```bash
+python models/embeddinggemma/validate_accuracy.py --mode reference \
+  --output-dir build/models/embeddinggemma/reference
+python models/embeddinggemma/benchmark.py \
+  --model build/models/embeddinggemma/embeddinggemma.rax \
+  --reference-dir build/models/embeddinggemma/reference \
+  --threads 4 --warmup 1 --repeat 10 --tolerance 1e-5 \
+  --output-dir build/models/embeddinggemma/benchmark
+```
+
+Choose a new output directory for each measurement. `--buddy-cli` and `--spec`
+override the default `build/bin/buddy-cli` and `specs/f32.json`. The script sets
+`OMP_NUM_THREADS` and disables dynamic OpenMP thread counts; CPU affinity is
+inherited from the caller.
+
+Warmup rounds prepare the extracted payload cache and are excluded from the
+statistics. Each request starts a new process and reloads the model, so the
+forward timing includes first-call initialization and is not resident-model
+steady-state latency. End-to-end timing includes the GNU time wrapper; peak
+RSS covers the runner's entire lifetime, including weights and temporary data.
+
+`report.json` contains the configuration, each measured request, latency
+mean/median/min/max/population standard deviation, maximum peak RSS, model
+package size, and validation status. Raw logs and embeddings are kept under
+`runs/<round>/`; `warmup/` holds the unmeasured runs. The extracted payloads are
+cached under `payload/`. After timing, every measured round is checked by
+`validate_accuracy.compare_outputs`; a failed request, missing measurement,
+timeout, or numerical mismatch returns a nonzero exit status. A timeout also
+terminates the runner process group. No Git metadata or hashes are collected.
+
 ## Notes
 
 - The `.rax` and other artifacts live in the **build** directory

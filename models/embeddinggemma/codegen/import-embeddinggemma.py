@@ -21,7 +21,6 @@ import os
 
 import numpy
 import torch
-import torch._dynamo
 import torch.nn as nn
 from buddy.compiler.frontend import DynamoCompiler
 from buddy.compiler.graph import GraphDriver
@@ -165,59 +164,11 @@ print(f"   attention_mask: {tuple(dummy_attention_mask.shape)}")
 # ==============================================================================
 print("\n[import-embeddinggemma] Tracing forward graph...")
 
-print("\n[Debug] Running torch._dynamo.explain...")
-
-try:
-    explain_result = torch._dynamo.explain(model)(
-        dummy_input_ids,
-        dummy_attention_mask,
-    )
-
-    print(
-        f"[Debug] graph_count: "
-        f"{explain_result.graph_count}"
-    )
-    print(
-        f"[Debug] graph_break_count: "
-        f"{explain_result.graph_break_count}"
-    )
-
-    for i, reason in enumerate(explain_result.break_reasons):
-        print(f"\n[GraphBreak {i}]")
-        print(reason.reason)
-        print(reason.user_stack)
-
-except Exception as exc:
-    print(f"[Debug] explain failed: {exc!r}")
-
-torch._dynamo.reset()
-
 with torch.no_grad():
     graphs = dc.importer(
         model,
         input_ids=dummy_input_ids,
         attention_mask=dummy_attention_mask,
-    )
-
-print(f"\n[Debug] Imported {len(graphs)} graphs")
-
-for i, graph in enumerate(graphs):
-    print(
-        f"Graph {i}: "
-        f"name={graph._func_name}, "
-        f"nodes={len(graph.body)}, "
-        f"inputs={len(graph.inputs)}, "
-        f"params={len(graph.params)}"
-    )
-
-    print(
-        "  First nodes:",
-        [node.name for node in graph.body[:5]]
-    )
-
-    print(
-        "  Last nodes:",
-        [node.name for node in graph.body[-5:]]
     )
 
 assert len(graphs) == 1, f"Expected 1 graph, got {len(graphs)}"
@@ -241,83 +192,11 @@ graph.group_map_device["subgraph0"] = DeviceType.CPU
 driver = GraphDriver(graph)
 driver.subgraphs[0].lower_to_top_level_ir()
 
-
-def _repair_subgraph0(module_text):
-    """Repair two classes of invalid ops the buddy-codegen TOSA lowering emits
-    for Gemma3's float attention mask.
-
-    1) `arith.select` with an f32 condition (mask elements used directly as a
-       boolean) is not valid MLIR. Rewrite it to `arith.cmpf ne %cond, 0.0`
-       followed by an i1-conditioned select (nonzero -> keep).
-    2) `tosa.bitwise_or` / `tosa.bitwise_and` on f32 tensors is invalid TOSA
-       (bitwise ops require integer types). The operands are always 0.0/1.0
-       masks (they come from `tosa.cast` of i1 masks plus 0.0/1.0 constants),
-       so OR is elementwise max and AND is elementwise min. Replace with
-       `tosa.maximum` / `tosa.minimum`, which are valid f32 TOSA ops with the
-       identical type signature and the same result on {0, 1} masks.
-    """
-    import re
-
-    sel_pat = re.compile(
-        r'^(\s*)%(\w+) = "arith\.select"\((%\w+), (%\w+), (%\w+)\) : '
-        r"\(f32, f32, f32\) -> f32$",
-        re.M,
-    )
-
-    def _sel_repl(mo):
-        ind, res, cond, t, f = (
-            mo.group(1),
-            mo.group(2),
-            mo.group(3),
-            mo.group(4),
-            mo.group(5),
-        )
-        return "\n".join(
-            [
-                f'{ind}%selz_{res} = "arith.constant"() '
-                f"<{{value = 0.000000e+00 : f32}}> : () -> f32",
-                f'{ind}%selc_{res} = "arith.cmpf"({cond}, %selz_{res}) '
-                f"<{{fastmath = #arith.fastmath<none>, predicate = 13 : i64}}> : "
-                f"(f32, f32) -> i1",
-                f'{ind}%{res} = "arith.select"(%selc_{res}, {t}, {f}) : '
-                f"(i1, f32, f32) -> f32",
-            ]
-        )
-
-    module_text = sel_pat.sub(_sel_repl, module_text)
-
-    f32ty = r"(?:tensor<[^>]*f32>|f32)"
-    _bit_pat = re.compile(
-        r'"(tosa\.bitwise_or|tosa\.bitwise_and)"\(([^)]*)\) : \('
-        + r"("
-        + f32ty
-        + r"), ("
-        + f32ty
-        + r")\) -> ("
-        + f32ty
-        + r")"
-    )
-
-    def _bit_repl(mo):
-        op = mo.group(1)
-        repl = "tosa.maximum" if op == "tosa.bitwise_or" else "tosa.minimum"
-        return (
-            f'"{repl}"({mo.group(2)}) : ({mo.group(3)}, {mo.group(4)}) -> '
-            f"{mo.group(5)}"
-        )
-
-    module_text = _bit_pat.sub(_bit_repl, module_text)
-    return module_text
-
-
 # ==============================================================================
 # 7. Save outputs at the output-dir ROOT (single_forward build convention)
 # ==============================================================================
 with open(os.path.join(a.output_dir, "subgraph0.mlir"), "w") as module_file:
-    print(
-        _repair_subgraph0(str(driver.subgraphs[0]._imported_module)),
-        file=module_file,
-    )
+    print(driver.subgraphs[0]._imported_module, file=module_file)
 with open(os.path.join(a.output_dir, "forward.mlir"), "w") as module_file:
     print(driver.construct_main_graph(True), file=module_file)
 

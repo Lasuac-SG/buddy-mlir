@@ -26,8 +26,9 @@
 //   post_processor: <bos> A <eos>
 //
 // This is a dependency-free reimplementation of that BPE pipeline:
-//   1. replace every ASCII space with the metaspace "▁",
+//   1. extract added tokens, then replace ASCII spaces with "▁" in other text,
 //   2. split the normalized UTF-8 string into codepoint symbols,
+//      using byte fallback for symbols outside the vocabulary,
 //   3. greedily apply the ranked merges table (lowest rank wins) until no
 //      adjacent pair is mergeable,
 //   4. map each resulting symbol to its vocab id (fusing consecutive
@@ -169,12 +170,32 @@ private:
       if (it != vocab_.end())
         unkId_ = it->second;
     }
+    byteFallback_ = model->getBoolean("byte_fallback").value_or(false);
   }
 
   void loadSpecialTokens(const llvm::json::Object &root) {
     bosId_ = findTokenId(root, "<bos>", 2);
     eosId_ = findTokenId(root, "<eos>", 1);
     padId_ = findTokenId(root, "<pad>", 0);
+    if (const auto *tokens = root.getArray("added_tokens")) {
+      for (const auto &value : *tokens) {
+        const auto *token = value.getAsObject();
+        if (!token || !token->getString("content") || !token->getInteger("id"))
+          throw std::runtime_error(
+              "EmbeddinggemmaTokenizer: malformed added token");
+        // EmbeddingGemma's added tokens use literal, unnormalized matching.
+        if (token->getBoolean("single_word").value_or(false) ||
+            token->getBoolean("lstrip").value_or(false) ||
+            token->getBoolean("rstrip").value_or(false) ||
+            token->getBoolean("normalized").value_or(false))
+          throw std::runtime_error(
+              "EmbeddinggemmaTokenizer: unsupported added token options");
+        std::string content = token->getString("content")->str();
+        if (!content.empty())
+          addedTokens_[content.front()].emplace_back(content,
+                                                     *token->getInteger("id"));
+      }
+    }
   }
 
   // Reads a special token's id via post_processor.special_tokens (authoritative
@@ -198,6 +219,36 @@ private:
   // ── Tokenization ──────────────────────────────────────────────────────
 
   std::vector<int64_t> tokenize(const std::string &text) const {
+    std::vector<int64_t> ids;
+    size_t start = 0;
+    auto appendText = [&](size_t end) {
+      auto pieces = tokenizeText(text.substr(start, end - start));
+      ids.insert(ids.end(), pieces.begin(), pieces.end());
+    };
+    for (size_t pos = 0; pos < text.size();) {
+      const std::pair<std::string, int64_t> *match = nullptr;
+      auto candidates = addedTokens_.find(text[pos]);
+      if (candidates != addedTokens_.end()) {
+        for (const auto &token : candidates->second) {
+          if ((!match || token.first.size() > match->first.size()) &&
+              text.compare(pos, token.first.size(), token.first) == 0)
+            match = &token;
+        }
+      }
+      if (!match) {
+        ++pos;
+        continue;
+      }
+      appendText(pos);
+      ids.push_back(match->second);
+      pos += match->first.size();
+      start = pos;
+    }
+    appendText(text.size());
+    return ids;
+  }
+
+  std::vector<int64_t> tokenizeText(const std::string &text) const {
     // Normalizer: " " -> "▁" (U+2581, UTF-8 E2 96 81).
     std::string norm;
     norm.reserve(text.size() + 4);
@@ -210,7 +261,25 @@ private:
 
     // The pre-tokenizer is a no-op after normalization (no literal space
     // remains), so the whole string is one pre-token. Run BPE on it.
-    std::vector<std::string> word = splitCodepoints(norm);
+    std::vector<std::string> word;
+    for (const auto &sym : splitCodepoints(norm)) {
+      std::vector<std::string> bytes;
+      if (byteFallback_ && !vocab_.count(sym)) {
+        constexpr char hex[] = "0123456789ABCDEF";
+        for (unsigned char byte : sym) {
+          std::string piece = "<0x00>";
+          piece[3] = hex[byte >> 4];
+          piece[4] = hex[byte & 15];
+          if (!vocab_.count(piece))
+            break;
+          bytes.push_back(piece);
+        }
+      }
+      if (!bytes.empty() && bytes.size() == sym.size())
+        word.insert(word.end(), bytes.begin(), bytes.end());
+      else
+        word.push_back(sym);
+    }
     bpeMerge(word);
 
     std::vector<int64_t> ids;
@@ -282,6 +351,9 @@ private:
 
   std::unordered_map<std::string, int64_t> vocab_;
   std::map<std::pair<std::string, std::string>, int> mergeRanks_;
+  std::unordered_map<char, std::vector<std::pair<std::string, int64_t>>>
+      addedTokens_;
+  bool byteFallback_ = false;
 
   int64_t bosId_ = 2;
   int64_t eosId_ = 1;
