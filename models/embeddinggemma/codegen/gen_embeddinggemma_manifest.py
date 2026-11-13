@@ -40,7 +40,12 @@ def normalize_uri(raw: str) -> str:
     return f"file:{s}"
 
 
-def gen_manifest(spec: dict, runner_library: str) -> str:
+def gen_manifest(
+    spec: dict,
+    runner_library: str,
+    dep_shared_libs: list[str] | None = None,
+    version: str = "0.1.0",
+) -> str:
     model_family = spec["model_family"]
     variant = spec.get("variant", "f32")
     model_id = spec.get("model_id", f"{model_family}_{variant}")
@@ -55,7 +60,7 @@ def gen_manifest(spec: dict, runner_library: str) -> str:
     lines = []
     p = lines.append
     p(f"rhal.module @{model_family} attributes {{")
-    p('    version = "0.1.0",')
+    p(f'    version = "{version}",')
     p(f'    model_name = "{model_id}",')
     p(f'    vocab_uri = "file:{tokenizer_file}",')
     p(f'    max_seq_len = "{max_seq_len}",')
@@ -70,6 +75,12 @@ def gen_manifest(spec: dict, runner_library: str) -> str:
     p('  rhal.codeobj @model_kernels {id = 1 : i32, kind = "host_shared_lib",')
     p('                                backend = "cpu",')
     p(f'                                uri = "file:{so_name}"}}')
+    for idx, dep in enumerate(dep_shared_libs or [], start=2):
+        p(
+            f'  rhal.codeobj @runtime_dep_{idx - 1} {{id = {idx} : i32, kind = "host_shared_lib",'
+        )
+        p('                                backend = "cpu",')
+        p(f'                                uri = "{normalize_uri(dep)}"}}')
     p("")
     p(
         f'  rhal.buffer @input_ids {{space = "host", '
@@ -108,12 +119,24 @@ def main() -> int:
     parser.add_argument(
         "-o", "--output", default="-", help="Output path (- for stdout)"
     )
+    parser.add_argument("--version", default="0.1.0", help="RAX module version")
+    parser.add_argument(
+        "--dep-shared-lib",
+        action="append",
+        default=[],
+        help="Runtime shared library URI/name (repeatable)",
+    )
     args = parser.parse_args()
 
     with open(args.spec) as f:
         spec = json.load(f)
 
-    text = gen_manifest(spec, args.runner_library)
+    text = gen_manifest(
+        spec,
+        args.runner_library,
+        dep_shared_libs=args.dep_shared_lib,
+        version=args.version,
+    )
 
     if args.output == "-":
         sys.stdout.write(text)
