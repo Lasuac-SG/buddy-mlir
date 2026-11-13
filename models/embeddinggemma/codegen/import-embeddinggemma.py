@@ -66,8 +66,26 @@ class EmbeddingGemmaWrapper(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         # 1. Transformer (Gemma3TextModel)
+        auto_model = self.transformer.auto_model
+        if input_ids.shape[1] > auto_model.config.sliding_window:
+            raise ValueError("Input length exceeds the bidirectional window")
+        # Embed IDs first to preserve the runner's (IDs, mask) input order.
+        inputs_embeds = auto_model.embed_tokens(input_ids)
+        # Within one bidirectional window, both layer types use this mask.
+        additive_mask = (
+            1.0 - attention_mask[:, None, None, :].float()
+        ) * torch.finfo(inputs_embeds.dtype).min
+        additive_mask = additive_mask.expand(
+            -1, 1, input_ids.shape[1], -1
+        ).contiguous()
         trans_out = self.transformer(
-            {"input_ids": input_ids, "attention_mask": attention_mask}
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": {
+                    "full_attention": additive_mask,
+                    "sliding_attention": additive_mask,
+                },
+            }
         )
         token_emb = trans_out["token_embeddings"]
 
